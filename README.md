@@ -5,11 +5,11 @@
 Both ship from this repo and are consumed by git tag:
 
 ```toml
-kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.2.0" }
+kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.2.1" }
 ```
 
 ```json
-"@dorsk/kagi": "github:DorskFR/kagi#v0.2.0"
+"@dorsk/kagi": "github:DorskFR/kagi#v0.2.1"
 ```
 
 kagi does the WebAuthn ceremonies and the rules around them. It returns verified
@@ -51,6 +51,10 @@ kagi does the WebAuthn ceremonies and the rules around them. It returns verified
     identifier + passkey with no password; the grant reference comes back from
     `finish_enrolment`.
   - The ceremony is bound to a `binding` string (session id, grant) checked again at the finish.
+  - `start_registration_with` keeps a small app value server side with the ceremony, such as the
+    label chosen at the start, and hands it back as `Registered::data` / `Enrolment::data`.
+    `finish_carried_registration` labels the passkey with it, so the finish request cannot rename
+    it.
 - **Account model** (`PasskeyRole`):
   - `Only`: the account has no password; passkeys are the only way in.
   - `Alternative`: passkeys sit next to the password, which keeps working.

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use webauthn_rs::prelude::AuthenticationResult;
 
 use crate::decoy::fake_passkey;
-use crate::kagi::write_back;
+use crate::kagi::{Verified, add, enrolment, write_back};
 use crate::*;
 
 const KEY: [u8; 32] = [7; 32];
@@ -20,6 +20,7 @@ type Row<'a> = (u64, u32, &'a [u8], Option<&'a [&'a str]>);
 #[derive(Default)]
 struct Credentials {
 	rows: Mutex<Vec<StoredPasskey<u32, u64>>>,
+	labels: Mutex<Vec<String>>,
 	updates: AtomicUsize,
 }
 
@@ -74,7 +75,8 @@ impl CredentialStore for Credentials {
 			.cloned())
 	}
 
-	async fn add(&self, user: &u32, passkey: &Passkey, _label: &str) -> Result<u64, Infallible> {
+	async fn add(&self, user: &u32, passkey: &Passkey, label: &str) -> Result<u64, Infallible> {
+		self.labels.lock().unwrap().push(label.to_owned());
 		let mut rows = self.rows.lock().unwrap();
 		let id = rows.iter().map(|row| row.id).max().unwrap_or(0) + 1;
 		rows.push(StoredPasskey {
@@ -366,6 +368,76 @@ async fn a_grant_enrols_an_identifier_and_a_passkey_without_a_password() {
 		.unwrap();
 	let bad = kagi.finish_enrolment(&store, &enrol.ceremony, "invite-7", &att);
 	assert!(matches!(bad.await, Err(Error::Rejected { name: None })));
+}
+
+#[tokio::test]
+async fn a_registration_carries_its_data_from_start_to_finish() {
+	let kagi = kagi();
+	let att = attestation();
+	let store = Credentials::default();
+
+	let plain = kagi
+		.start_registration(&store, account(1), fresh(), "s", home())
+		.await
+		.unwrap();
+	let unlabelled = kagi.finish_carried_registration(&store, &plain.ceremony, "s", &att);
+	assert!(matches!(unlabelled.await, Err(Error::Purpose)));
+	assert!(!kagi.ceremonies().holds(&plain.ceremony));
+
+	let carried = kagi
+		.start_registration_with(&store, account(1), fresh(), "s", home(), "Phone")
+		.await
+		.unwrap();
+	let other = kagi.finish_carried_registration(&store, &carried.ceremony, "t", &att);
+	assert!(matches!(other.await, Err(Error::Binding)));
+
+	let carried = kagi
+		.start_registration_with(&store, account(1), fresh(), "s", home(), "Phone")
+		.await
+		.unwrap();
+	let bad = kagi.finish_carried_registration(&store, &carried.ceremony, "s", &att);
+	assert!(matches!(bad.await, Err(Error::Rejected { name: None })));
+
+	let grant = Proof::Grant {
+		grant: "invite-3".into(),
+	};
+	let enrol = kagi
+		.start_registration_with(&store, account(2), grant, "g", home(), "Laptop")
+		.await
+		.unwrap();
+	let wrong = kagi.finish_carried_registration(&store, &enrol.ceremony, "g", &att);
+	assert!(matches!(wrong.await, Err(Error::Purpose)));
+	assert!(store.rows.lock().unwrap().is_empty());
+	assert!(kagi.ceremonies().keys().is_empty());
+}
+
+#[tokio::test]
+async fn a_verified_passkey_is_stored_under_its_label_with_its_data() {
+	let store = Credentials::default();
+	let verified = |data: Option<&str>| Verified {
+		user: 1,
+		passkey: fake_passkey(&[3; 16], None).unwrap(),
+		discoverable: Some(true),
+		data: data.map(str::to_owned),
+	};
+
+	let registered = add(&store, verified(Some("Phone")), "Phone").await.unwrap();
+	assert_eq!(registered.data.as_deref(), Some("Phone"));
+	assert!(registered.first);
+	assert_eq!(registered.discoverable, Some(true));
+	assert_eq!(*store.labels.lock().unwrap(), ["Phone"]);
+	let again = add(&store, verified(None), "Other").await;
+	assert!(matches!(again, Err(Error::Duplicate)));
+	let enrolled = enrolment(&store, verified(None), "g".into()).await;
+	assert!(matches!(enrolled, Err(Error::Duplicate)));
+
+	let fresh_store = Credentials::default();
+	let enrolled = enrolment(&fresh_store, verified(Some("Laptop")), "g".into())
+		.await
+		.unwrap();
+	assert_eq!(enrolled.data.as_deref(), Some("Laptop"));
+	assert_eq!(enrolled.grant, "g");
+	assert!(fresh_store.rows.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -792,6 +864,37 @@ mod shared_store {
 		let bad = kagi.finish_enrolment(&store, &enrol.ceremony, "g", &att);
 		assert!(matches!(bad.await, Err(Error::Rejected { name: None })));
 		assert!(kagi.ceremonies().rows.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn carried_data_survives_the_store_and_older_rows_still_load() {
+		let (kagi, att) = (shared(), attestation());
+		let store = Credentials::default();
+		let plain = kagi
+			.start_registration(&store, account(1), fresh(), "s", home())
+			.await
+			.unwrap();
+		let carried = kagi
+			.start_registration_with(&store, account(1), fresh(), "s", home(), "Phone")
+			.await
+			.unwrap();
+		let rows = kagi.ceremonies().rows.lock().unwrap().clone();
+		let plain_row = &rows[&ceremony_key(&plain.ceremony)];
+		let carried_row = &rows[&ceremony_key(&carried.ceremony)];
+		assert!(!plain_row.contains("\"data\""));
+		let carried_json: Value = serde_json::from_str(carried_row).unwrap();
+		assert_eq!(carried_json["step"]["Register"]["data"], "Phone");
+
+		let mut older = carried_json.clone();
+		older["step"]["Register"]
+			.as_object_mut()
+			.unwrap()
+			.remove("data");
+		let older: Ceremony<u32> = serde_json::from_value(older).unwrap();
+		assert_eq!(older.purpose(), Purpose::Register);
+
+		let bad = kagi.finish_carried_registration(&store, &carried.ceremony, "s", &att);
+		assert!(matches!(bad.await, Err(Error::Rejected { name: None })));
 	}
 
 	#[test]

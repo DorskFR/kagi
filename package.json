@@ -1,6 +1,6 @@
 {
 	"name": "@dorsk/kagi",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Browser side of kagi: passkey create/get over navigator.credentials, with conditional-UI autofill.",
 	"license": "MIT",
 	"type": "module",

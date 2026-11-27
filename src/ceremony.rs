@@ -48,12 +48,22 @@ pub(crate) enum Step<U> {
 		user: U,
 		binding: [u8; 32],
 		state: PasskeyRegistration,
+		#[cfg_attr(
+			feature = "serde",
+			serde(default, skip_serializing_if = "Option::is_none")
+		)]
+		data: Option<String>,
 	},
 	Enrol {
 		user: U,
 		grant: String,
 		binding: [u8; 32],
 		state: PasskeyRegistration,
+		#[cfg_attr(
+			feature = "serde",
+			serde(default, skip_serializing_if = "Option::is_none")
+		)]
+		data: Option<String>,
 	},
 	Named {
 		name: String,
