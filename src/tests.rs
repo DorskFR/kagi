@@ -688,3 +688,121 @@ fn the_ceremony_futures_and_errors_cross_threads() {
 	send(&kagi.finish_enrolment(&store, "c", "s", &att));
 	send(&kagi.remove(&store, &1, &1, PasskeyRole::Only, false));
 }
+
+#[test]
+fn a_counter_that_goes_backwards_is_its_own_refusal() {
+	use crate::kagi::refused;
+	use webauthn_rs::prelude::WebauthnError;
+	let cloned = refused(
+		&WebauthnError::CredentialPossibleCompromise,
+		Some("jeanne".into()),
+	);
+	assert!(matches!(cloned, Error::Cloned { name: Some(name) } if name == "jeanne"));
+	let bad = refused(&WebauthnError::InvalidRPIDHash, None);
+	assert!(matches!(bad, Error::Rejected { name: None }));
+}
+
+#[cfg(feature = "serde")]
+mod shared_store {
+	use std::collections::HashMap;
+
+	use super::*;
+
+	/// A store that keeps nothing but serialized ceremonies, like one shared between replicas.
+	#[derive(Default)]
+	struct Serialized {
+		rows: Mutex<HashMap<[u8; 32], String>>,
+	}
+
+	impl CeremonyStore<u32> for Serialized {
+		async fn begin(&self, _: Option<IpAddr>, ceremony: Ceremony<u32>) -> Result<String, Error> {
+			let id = ceremony_id()?;
+			let json = serde_json::to_string(&ceremony).map_err(Error::internal)?;
+			self.rows.lock().unwrap().insert(ceremony_key(&id), json);
+			Ok(id)
+		}
+
+		async fn take(&self, id: &str) -> Result<Option<Ceremony<u32>>, Error> {
+			let row = self.rows.lock().unwrap().remove(&ceremony_key(id));
+			row.map(|json| serde_json::from_str(&json).map_err(Error::internal))
+				.transpose()
+		}
+	}
+
+	fn shared() -> Kagi<u32, Serialized> {
+		let url = url();
+		Kagi::new(Settings::new(&url, "kagi", &KEY), Serialized::default()).unwrap()
+	}
+
+	#[tokio::test]
+	async fn every_ceremony_survives_a_round_trip_through_its_serialized_form() {
+		let (kagi, att) = (shared(), attestation());
+		let store = Credentials::with(&[(1, 1, &[1; 20], None)]);
+
+		let named = kagi
+			.start_sign_in(&store, "jeanne", Some(&1), home())
+			.await
+			.unwrap();
+		let decoy = kagi
+			.start_sign_in(&store, "paul", None, home())
+			.await
+			.unwrap();
+		let discoverable = kagi.start_discoverable(home(), true).await.unwrap();
+		let register = kagi
+			.start_registration(&store, account(1), fresh(), "s", home())
+			.await
+			.unwrap();
+		let grant = Proof::Grant {
+			grant: "invite-1".into(),
+		};
+		let enrol = kagi
+			.start_registration(&store, account(2), grant, "g", home())
+			.await
+			.unwrap();
+
+		let stored: Vec<String> = kagi
+			.ceremonies()
+			.rows
+			.lock()
+			.unwrap()
+			.values()
+			.cloned()
+			.collect();
+		assert_eq!(stored.len(), 5);
+		for id in [&named.ceremony, &register.ceremony, &enrol.ceremony] {
+			assert!(stored.iter().all(|json| !json.contains(id.as_str())));
+		}
+		for json in &stored {
+			let ceremony: Ceremony<u32> = serde_json::from_str(json).unwrap();
+			assert_eq!(&serde_json::to_string(&ceremony).unwrap(), json);
+		}
+
+		let answer = assertion(&[1; 20], None);
+		let named = kagi.finish_sign_in(&store, &named.ceremony, &answer).await;
+		assert!(matches!(named, Err(Error::Rejected { name: Some(name) }) if name == "jeanne"));
+		let decoy = kagi.finish_sign_in(&store, &decoy.ceremony, &answer).await;
+		assert!(matches!(decoy, Err(Error::Rejected { name: Some(name) }) if name == "paul"));
+		let answer = assertion(&[1; 20], Some(store.user_handle(&1)));
+		let discoverable = kagi
+			.finish_sign_in(&store, &discoverable.ceremony, &answer)
+			.await;
+		assert!(matches!(discoverable, Err(Error::Rejected { name: None })));
+		let other = kagi.finish_registration(&store, &register.ceremony, "t", &att, "x");
+		assert!(matches!(other.await, Err(Error::Binding)));
+		let bad = kagi.finish_enrolment(&store, &enrol.ceremony, "g", &att);
+		assert!(matches!(bad.await, Err(Error::Rejected { name: None })));
+		assert!(kagi.ceremonies().rows.lock().unwrap().is_empty());
+	}
+
+	#[test]
+	fn a_purpose_has_a_stable_name() {
+		for (purpose, name) in [
+			(Purpose::Register, "register"),
+			(Purpose::SignIn, "sign-in"),
+			(Purpose::Enrol, "enrol"),
+		] {
+			assert_eq!(purpose.as_str(), name);
+			assert_eq!(serde_json::to_value(purpose).unwrap(), name);
+		}
+	}
+}

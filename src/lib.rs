@@ -12,7 +12,9 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use ceremony::{Ceremony, CeremonyStore, Limits, MemoryCeremonies, Purpose, network};
+pub use ceremony::{
+	Ceremony, CeremonyStore, Limits, MemoryCeremonies, Purpose, ceremony_id, ceremony_key, network,
+};
 pub use credential::{CredentialStore, Removal, Stored, StoredPasskey, derived_handle};
 pub use decoy::{Decoys, normalize};
 pub use error::{Error, StoreError};

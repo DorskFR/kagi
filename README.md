@@ -5,11 +5,11 @@
 Both ship from this repo and are consumed by git tag:
 
 ```toml
-kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.1.0" }
+kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.2.0" }
 ```
 
 ```json
-"@dorsk/kagi": "github:DorskFR/kagi#v0.1.0"
+"@dorsk/kagi": "github:DorskFR/kagi#v0.2.0"
 ```
 
 kagi does the WebAuthn ceremonies and the rules around them. It returns verified
@@ -17,8 +17,9 @@ kagi does the WebAuthn ceremonies and the rules around them. It returns verified
 
 ## Rules kagi enforces
 
-- **Relying party from one public URL.** The host is the RP id and the URL the only origin. Paths,
-  queries, fragments, credentials, IP literals and plain http outside `localhost` are refused.
+- **Relying party from one public URL.** The URL is the only origin and its host the RP id, or
+  `Settings::rp_id` when that names a parent domain of the host. Paths, queries, fragments,
+  credentials, IP literals and plain http outside `localhost` are refused.
 - **Ceremonies** (`CeremonyStore`, in-memory `MemoryCeremonies`):
   - ids are 32 random bytes and only their SHA-256 is stored;
   - each has a purpose (register, sign-in, enrol by grant), is single-use (taken even when the
@@ -26,8 +27,15 @@ kagi does the WebAuthn ceremonies and the rules around them. It returns verified
   - one client address (IPv6 grouped by /64) holds at most 20; more is refused with a retry delay
     and never evicts anyone else's ceremony;
   - 10,000 in total; more is refused (`Error::Busy`), nothing is evicted.
+  - with the `serde` feature a `Ceremony` serializes, so apps running several replicas can keep
+    ceremonies in a shared store (Postgres, Redis). Such a store follows the same contract: ids
+    from `ceremony_id`, only `ceremony_key(id)` kept, `take` removes the row even when it has
+    expired, and the limits above (`Limits`, addresses grouped by `network`). The serialized
+    form holds the webauthn-rs challenge state: it stays server side.
 - **Sign-in:** username-first, usernameless (discoverable) and conditional-UI autofill. After every
-  sign-in the counter and backup flags are written back through `CredentialStore::update`.
+  sign-in the counter and backup flags are written back through `CredentialStore::update`. A
+  signature counter that does not move forward refuses the sign-in with `Error::Cloned`, apart
+  from `Error::Rejected`, so the app can log it as a possibly cloned key.
 - **Decoys:** an unknown name and a name without passkeys get the same answer as each other,
   shaped exactly like a real one (same webauthn-rs serializer). Credential ids come from
   webauthn-rs's fake distribution keyed by an app-supplied HMAC key, so they are stable for a name
@@ -58,10 +66,10 @@ kagi does the WebAuthn ceremonies and the rules around them. It returns verified
 ## What stays in the app
 
 Sessions and cookies, CSRF and `Origin` checks, user tables, HTTP routes, resolving a typed name to
-a user, rate limiting (count every `Error::Rejected { name }`: it carries the name the sign-in was
-started for), keeping `SignedIn::at` on the session it opens, ending sessions when a passkey is
-removed or when the first passkey replaces the password, storing an `Enrolment` and consuming its
-grant in one transaction, and passkey labels and listing.
+a user, rate limiting (count every `Error::Rejected { name }` and `Error::Cloned { name }`: they
+carry the name the sign-in was started for), keeping `SignedIn::at` on the session it opens, ending
+sessions when a passkey is removed or when the first passkey replaces the password, storing an
+`Enrolment` and consuming its grant in one transaction, and passkey labels and listing.
 
 ## Rust
 
