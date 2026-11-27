@@ -14,19 +14,35 @@ use crate::Error;
 const ID_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum Purpose {
 	Register,
 	SignIn,
 	Enrol,
 }
 
-/// A ceremony between its start and finish requests. Its state stays server side.
+impl Purpose {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Register => "register",
+			Self::SignIn => "sign-in",
+			Self::Enrol => "enrol",
+		}
+	}
+}
+
+/// A ceremony between its start and finish requests. Its state stays server side: with the
+/// `serde` feature a shared store can keep it serialized, which holds the webauthn-rs
+/// challenge state and so must never reach the client.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ceremony<U> {
 	pub(crate) step: Step<U>,
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) enum Step<U> {
 	Register {
 		user: U,
@@ -61,10 +77,11 @@ impl<U> Ceremony<U> {
 
 /// Where ceremonies wait between start and finish.
 ///
-/// An implementation hands out random ids and keeps only their SHA-256, gives a ceremony back
-/// once and only within its lifetime, caps how many one client address holds without ever
-/// dropping another address's ceremonies, and refuses new ceremonies when full instead of
-/// evicting live ones.
+/// An implementation hands out ids from [`ceremony_id`] and keeps only their
+/// [`ceremony_key`], gives a ceremony back once and only within its lifetime (taking it removes
+/// it even when it has expired), caps how many one client [`network`] holds without ever
+/// dropping another address's ceremonies (`Error::TooMany`), and refuses new ceremonies when
+/// full instead of evicting live ones (`Error::Busy`).
 pub trait CeremonyStore<U>: Send + Sync {
 	fn begin(
 		&self,
@@ -72,7 +89,8 @@ pub trait CeremonyStore<U>: Send + Sync {
 		ceremony: Ceremony<U>,
 	) -> impl Future<Output = Result<String, Error>> + Send;
 
-	fn take(&self, id: &str) -> impl Future<Output = Option<Ceremony<U>>> + Send;
+	/// `Ok(None)` for an unknown, used or expired id.
+	fn take(&self, id: &str) -> impl Future<Output = Result<Option<Ceremony<U>>, Error>> + Send;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +140,13 @@ pub(crate) fn digest(bytes: &[u8]) -> [u8; 32] {
 	Sha256::digest(bytes).into()
 }
 
-pub(crate) fn random_id() -> Result<String, Error> {
+/// What a store keeps instead of a ceremony id.
+pub fn ceremony_key(id: &str) -> [u8; 32] {
+	digest(id.as_bytes())
+}
+
+/// A new ceremony id: 32 random bytes, hex encoded.
+pub fn ceremony_id() -> Result<String, Error> {
 	let mut bytes = [0u8; ID_BYTES];
 	getrandom::fill(&mut bytes).map_err(Error::internal)?;
 	Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -169,7 +193,7 @@ impl<U> MemoryCeremonies<U> {
 		if entries.len() >= global {
 			return Err(Error::Busy);
 		}
-		let id = random_id()?;
+		let id = ceremony_id()?;
 		entries.insert(
 			digest(id.as_bytes()),
 			Entry {
@@ -202,8 +226,8 @@ impl<U: Send> CeremonyStore<U> for MemoryCeremonies<U> {
 		self.begin_at(Instant::now(), address, ceremony)
 	}
 
-	async fn take(&self, id: &str) -> Option<Ceremony<U>> {
-		self.take_at(Instant::now(), id)
+	async fn take(&self, id: &str) -> Result<Option<Ceremony<U>>, Error> {
+		Ok(self.take_at(Instant::now(), id))
 	}
 }
 

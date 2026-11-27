@@ -1,6 +1,6 @@
 [package]
 name = "kagi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -15,6 +15,10 @@ unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+
+[features]
+# Serializable ceremonies, for stores shared between replicas.
+serde = ["webauthn-rs/danger-allow-state-serialisation"]
 
 [dependencies]
 base64 = "0.23"

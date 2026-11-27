@@ -8,10 +8,11 @@ fmt:
 
 lint:
 	cargo fmt --check
-	$(LOCK) cargo clippy --all-targets --locked -- -D warnings
+	$(LOCK) cargo clippy --all-targets --all-features --locked -- -D warnings
 	npm run check
 	npm run lint
 
 test:  ## Also regenerates the TypeScript wire types in ts/generated
 	$(LOCK) cargo test --locked
+	$(LOCK) cargo test --locked --features serde
 	npm test

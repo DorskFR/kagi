@@ -3,9 +3,10 @@ use webauthn_rs::{Webauthn, WebauthnBuilder};
 
 use crate::Error;
 
-/// The relying party of a public URL: its host is the RP id and the URL the only origin.
-/// Plain http is accepted for `localhost` only, the one insecure context browsers allow.
-pub fn relying_party(url: &Url, rp_name: &str) -> Result<Webauthn, Error> {
+/// The relying party of a public URL: the URL is the only origin and its host the RP id, unless
+/// `rp_id` names a parent domain of that host. Plain http is accepted for `localhost` only, the
+/// one insecure context browsers allow.
+pub fn relying_party(url: &Url, rp_id: Option<&str>, rp_name: &str) -> Result<Webauthn, Error> {
 	let refuse = |why: &str| Err(Error::Config(format!("{url}: {why}")));
 	if !matches!(url.scheme(), "https" | "http") {
 		return refuse("the public URL must be http or https");
@@ -23,7 +24,17 @@ pub fn relying_party(url: &Url, rp_name: &str) -> Result<Webauthn, Error> {
 	if url.scheme() == "http" && !local {
 		return refuse("passkeys need https outside localhost");
 	}
-	Ok(WebauthnBuilder::new(host, url)?.rp_name(rp_name).build()?)
+	let rp_id = rp_id.unwrap_or(host);
+	let covered = rp_id == host
+		|| host
+			.strip_suffix(rp_id)
+			.is_some_and(|sub| sub.ends_with('.') && !rp_id.starts_with('.'));
+	if !covered || (!rp_id.contains('.') && rp_id != "localhost") {
+		return Err(Error::Config(format!(
+			"{rp_id}: the RP id must be the host of {url} or a parent domain of it"
+		)));
+	}
+	Ok(WebauthnBuilder::new(rp_id, url)?.rp_name(rp_name).build()?)
 }
 
 #[cfg(test)]
@@ -39,7 +50,7 @@ mod tests {
 			"http://localhost:8080",
 			"http://app.localhost:5173/",
 		] {
-			let webauthn = relying_party(&Url::parse(good).unwrap(), "kagi");
+			let webauthn = relying_party(&Url::parse(good).unwrap(), None, "kagi");
 			assert!(webauthn.is_ok(), "{good}: {webauthn:?}");
 		}
 		for bad in [
@@ -54,9 +65,28 @@ mod tests {
 			"ftp://kira.example",
 		] {
 			assert!(
-				relying_party(&Url::parse(bad).unwrap(), "kagi").is_err(),
+				relying_party(&Url::parse(bad).unwrap(), None, "kagi").is_err(),
 				"{bad}"
 			);
 		}
+	}
+
+	#[test]
+	fn an_rp_id_override_must_be_the_host_or_a_parent_domain() {
+		let url = Url::parse("https://app.kira.example").unwrap();
+		for good in ["kira.example", "app.kira.example"] {
+			assert!(relying_party(&url, Some(good), "kagi").is_ok(), "{good}");
+		}
+		for bad in [
+			"elsewhere.test",
+			"pp.kira.example",
+			"example",
+			".kira.example",
+			"",
+		] {
+			assert!(relying_party(&url, Some(bad), "kagi").is_err(), "{bad}");
+		}
+		let local = Url::parse("http://app.localhost:5173").unwrap();
+		assert!(relying_party(&local, Some("localhost"), "kagi").is_ok());
 	}
 }

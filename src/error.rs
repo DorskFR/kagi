@@ -22,6 +22,10 @@ pub enum Error {
 	/// started for, so the app can count the failure against it.
 	#[error("the passkey was not accepted")]
 	Rejected { name: Option<String> },
+	/// The passkey verified but its signature counter did not move forward: the key may have
+	/// been cloned. `name` is as for `Rejected`.
+	#[error("the passkey's signature counter went backwards")]
+	Cloned { name: Option<String> },
 	#[error("sign in again before adding a passkey")]
 	StepUp,
 	#[error("this passkey is already registered")]

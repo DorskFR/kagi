@@ -6,7 +6,7 @@ use serde_json::json;
 use webauthn_rs::Webauthn;
 use webauthn_rs::prelude::{
 	AuthenticationResult, CreationChallengeResponse, Passkey, PublicKeyCredential,
-	RegisterPublicKeyCredential, Url,
+	RegisterPublicKeyCredential, Url, WebauthnError,
 };
 
 use crate::ceremony::{Step, digest};
@@ -49,6 +49,9 @@ impl ResidentKey {
 #[derive(Debug, Clone, Copy)]
 pub struct Settings<'a> {
 	pub url: &'a Url,
+	/// The RP id when it is not the URL's host: a parent domain of the host, so passkeys
+	/// also work on its other subdomains.
+	pub rp_id: Option<&'a str>,
 	pub rp_name: &'a str,
 	/// At least 32 bytes, kept across restarts.
 	pub decoy_key: &'a [u8],
@@ -60,6 +63,7 @@ impl<'a> Settings<'a> {
 	pub const fn new(url: &'a Url, rp_name: &'a str, decoy_key: &'a [u8]) -> Self {
 		Self {
 			url,
+			rp_id: None,
 			rp_name,
 			decoy_key,
 			step_up: DEFAULT_STEP_UP,
@@ -132,7 +136,7 @@ where
 {
 	pub fn new(settings: Settings<'_>, ceremonies: S) -> Result<Self, Error> {
 		Ok(Self {
-			webauthn: relying_party(settings.url, settings.rp_name)?,
+			webauthn: relying_party(settings.url, settings.rp_id, settings.rp_name)?,
 			decoys: Decoys::new(settings.decoy_key)?,
 			ceremonies,
 			step_up: settings.step_up,
@@ -150,7 +154,7 @@ where
 	}
 
 	async fn take(&self, id: &str, purpose: Purpose) -> Result<Step<U>, Error> {
-		let ceremony = self.ceremonies.take(id).await.ok_or(Error::Ceremony)?;
+		let ceremony = self.ceremonies.take(id).await?.ok_or(Error::Ceremony)?;
 		if ceremony.purpose() != purpose {
 			return Err(Error::Purpose);
 		}
@@ -385,7 +389,7 @@ where
 				let result = self
 					.webauthn
 					.finish_passkey_authentication(credential, &state)
-					.map_err(|_| rejected())?;
+					.map_err(|error| refused(&error, Some(name.clone())))?;
 				let stored = store
 					.passkeys(&user)
 					.await
@@ -418,7 +422,7 @@ where
 				let result = self
 					.webauthn
 					.finish_discoverable_authentication_v2(credential, state, &stored.passkey)
-					.map_err(|_| rejected())?;
+					.map_err(|error| refused(&error, None))?;
 				write_back(store, stored, &result).await
 			}
 			Step::Register { .. } | Step::Enrol { .. } => Err(Error::Purpose),
@@ -450,6 +454,14 @@ where
 			Removal::NotFound => Err(Error::NotFound),
 			Removal::Last => Err(Error::LastCredential),
 		}
+	}
+}
+
+/// A signature counter at or below the stored one says two copies of the key exist.
+pub(crate) fn refused(error: &WebauthnError, name: Option<String>) -> Error {
+	match error {
+		WebauthnError::CredentialPossibleCompromise => Error::Cloned { name },
+		_ => Error::Rejected { name },
 	}
 }
 
