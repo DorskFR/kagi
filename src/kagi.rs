@@ -90,6 +90,8 @@ pub struct Registered<U, P> {
 	pub first: bool,
 	/// What the browser said through credProps, unsigned.
 	pub discoverable: Option<bool>,
+	/// What `start_registration_with` carried.
+	pub data: Option<String>,
 }
 
 /// A verified passkey for a grant, not stored yet: the app stores it and consumes the grant in
@@ -100,6 +102,8 @@ pub struct Enrolment<U> {
 	pub grant: String,
 	pub passkey: Passkey,
 	pub discoverable: Option<bool>,
+	/// What `start_registration_with` carried.
+	pub data: Option<String>,
 }
 
 /// A verified sign-in. `at` is the assertion time the app keeps on the session it opens and
@@ -174,6 +178,48 @@ where
 	where
 		C: CredentialStore<User = U>,
 	{
+		self.start(store, account, proof, binding, address, None)
+			.await
+	}
+
+	/// `start_registration` that keeps `data` server side with the ceremony and hands it back
+	/// at the finish, such as the passkey's label chosen at the start. Keep it small: it lives
+	/// in the ceremony store until the finish.
+	pub async fn start_registration_with<C>(
+		&self,
+		store: &C,
+		account: Account<'_, U>,
+		proof: Proof,
+		binding: &str,
+		address: Option<IpAddr>,
+		data: &str,
+	) -> Result<RegistrationChallenge, Error>
+	where
+		C: CredentialStore<User = U>,
+	{
+		self.start(
+			store,
+			account,
+			proof,
+			binding,
+			address,
+			Some(data.to_owned()),
+		)
+		.await
+	}
+
+	async fn start<C>(
+		&self,
+		store: &C,
+		account: Account<'_, U>,
+		proof: Proof,
+		binding: &str,
+		address: Option<IpAddr>,
+		data: Option<String>,
+	) -> Result<RegistrationChallenge, Error>
+	where
+		C: CredentialStore<User = U>,
+	{
 		proof.purpose(SystemTime::now(), self.step_up)?;
 		let existing = store.passkeys(&account.user).await.map_err(Error::store)?;
 		let exclude = existing
@@ -195,11 +241,13 @@ where
 				grant,
 				binding,
 				state,
+				data,
 			},
 			Proof::RecentSignIn { .. } => Step::Register {
 				user,
 				binding,
 				state,
+				data,
 			},
 		};
 		let ceremony = self.ceremonies.begin(address, Ceremony { step }).await?;
@@ -218,10 +266,42 @@ where
 	where
 		C: CredentialStore<User = U>,
 	{
+		self.finish(store, ceremony, binding, credential, Some(label))
+			.await
+	}
+
+	/// `finish_registration` labelling the passkey with the data its start carried.
+	/// A ceremony started without data is refused with `Error::Purpose`.
+	pub async fn finish_carried_registration<C>(
+		&self,
+		store: &C,
+		ceremony: &str,
+		binding: &str,
+		credential: &RegisterPublicKeyCredential,
+	) -> Result<Registered<U, C::PasskeyId>, Error>
+	where
+		C: CredentialStore<User = U>,
+	{
+		self.finish(store, ceremony, binding, credential, None)
+			.await
+	}
+
+	async fn finish<C>(
+		&self,
+		store: &C,
+		ceremony: &str,
+		binding: &str,
+		credential: &RegisterPublicKeyCredential,
+		label: Option<&str>,
+	) -> Result<Registered<U, C::PasskeyId>, Error>
+	where
+		C: CredentialStore<User = U>,
+	{
 		let Step::Register {
 			user,
 			binding: bound,
 			state,
+			data,
 		} = self.take(ceremony, Purpose::Register).await?
 		else {
 			return Err(Error::Purpose);
@@ -229,33 +309,18 @@ where
 		if bound != digest(binding.as_bytes()) {
 			return Err(Error::Binding);
 		}
+		let label = label.or(data.as_deref()).ok_or(Error::Purpose)?.to_owned();
 		let passkey = self
 			.webauthn
 			.finish_passkey_registration(credential, &state)
 			.map_err(|_| Error::Rejected { name: None })?;
-		if store
-			.find(passkey.cred_id())
-			.await
-			.map_err(Error::store)?
-			.is_some()
-		{
-			return Err(Error::Duplicate);
-		}
-		let first = store
-			.passkeys(&user)
-			.await
-			.map_err(Error::store)?
-			.is_empty();
-		let id = store
-			.add(&user, &passkey, label)
-			.await
-			.map_err(Error::store)?;
-		Ok(Registered {
+		let verified = Verified {
 			user,
-			passkey: id,
-			first,
+			passkey,
 			discoverable: discoverable(credential),
-		})
+			data,
+		};
+		add(store, verified, &label).await
 	}
 
 	/// Finishes a registration started with `Proof::Grant`. Nothing is stored.
@@ -274,6 +339,7 @@ where
 			grant,
 			binding: bound,
 			state,
+			data,
 		} = self.take(ceremony, Purpose::Enrol).await?
 		else {
 			return Err(Error::Purpose);
@@ -285,20 +351,13 @@ where
 			.webauthn
 			.finish_passkey_registration(credential, &state)
 			.map_err(|_| Error::Rejected { name: None })?;
-		if store
-			.find(passkey.cred_id())
-			.await
-			.map_err(Error::store)?
-			.is_some()
-		{
-			return Err(Error::Duplicate);
-		}
-		Ok(Enrolment {
+		let verified = Verified {
 			user,
-			grant,
 			passkey,
 			discoverable: discoverable(credential),
-		})
+			data,
+		};
+		enrolment(store, verified, grant).await
 	}
 
 	/// Starts a username-first sign-in. `user` is who `name` resolves to, if anyone: an
@@ -463,6 +522,66 @@ pub(crate) fn refused(error: &WebauthnError, name: Option<String>) -> Error {
 		WebauthnError::CredentialPossibleCompromise => Error::Cloned { name },
 		_ => Error::Rejected { name },
 	}
+}
+
+/// A passkey whose attestation verified, with what its ceremony carried.
+pub(crate) struct Verified<U> {
+	pub(crate) user: U,
+	pub(crate) passkey: Passkey,
+	pub(crate) discoverable: Option<bool>,
+	pub(crate) data: Option<String>,
+}
+
+async fn unknown<C: CredentialStore>(store: &C, passkey: &Passkey) -> Result<(), Error> {
+	match store.find(passkey.cred_id()).await.map_err(Error::store)? {
+		Some(_) => Err(Error::Duplicate),
+		None => Ok(()),
+	}
+}
+
+pub(crate) async fn add<C: CredentialStore>(
+	store: &C,
+	verified: Verified<C::User>,
+	label: &str,
+) -> Result<Registered<C::User, C::PasskeyId>, Error> {
+	let Verified {
+		user,
+		passkey,
+		discoverable,
+		data,
+	} = verified;
+	unknown(store, &passkey).await?;
+	let first = store
+		.passkeys(&user)
+		.await
+		.map_err(Error::store)?
+		.is_empty();
+	let id = store
+		.add(&user, &passkey, label)
+		.await
+		.map_err(Error::store)?;
+	Ok(Registered {
+		user,
+		passkey: id,
+		first,
+		discoverable,
+		data,
+	})
+}
+
+pub(crate) async fn enrolment<C: CredentialStore>(
+	store: &C,
+	verified: Verified<C::User>,
+	grant: String,
+) -> Result<Enrolment<C::User>, Error> {
+	unknown(store, &verified.passkey).await?;
+	Ok(Enrolment {
+		user: verified.user,
+		grant,
+		passkey: verified.passkey,
+		discoverable: verified.discoverable,
+		data: verified.data,
+	})
 }
 
 fn discoverable(credential: &RegisterPublicKeyCredential) -> Option<bool> {
